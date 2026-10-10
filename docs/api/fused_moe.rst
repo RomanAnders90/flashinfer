@@ -131,8 +131,43 @@ FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
 parameters, and routing from logits are unsupported. BF16 uses the measured
 model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
-artifact and native-plan bounds are checked per call. Configure another backend
-alongside Frost if unsupported calls need a fallback.
+artifact and native-runner bounds are checked during packing. Explicitly configured
+Frost runners accept the initialized configuration and report invalid input packs
+from ``pack_inputs``. Automatic candidate registration separately applies its
+supported-model and shape policy before admitting Frost.
+
+The four Frost runners share an engine that captures the compiler identity,
+artifact catalog, shortlist, and FMA configuration at build time. Kernel
+candidates and workspace capacity are shared within each token bucket. Native
+executors retain fixed kernels and model geometry, read the actual token count
+on each launch, and are reused across buckets. Frost uses the standard
+``accepts / pack_inputs / forward`` runner flow: ``accepts`` returns ``True``,
+and packing validates each call's current
+input and weight packs. Packed inputs own their launch state, so no validated
+input views are retained between calls. Warm calls do not inspect the assembler
+executable. MoELayer caches Frost winners by token bucket and routing mode,
+as it does for the other backends; automatic candidates also qualify the key
+by the eligible candidate pool.
+Warm packing looks up one bucket state. Profiling hooks and tuning configuration
+are created only when requested by the autotuner.
+Quantized FC1 weight scales accept both canonical expert-major storage and
+branch-major packed storage. Tensor Core descriptors and FMA kernels use the
+supplied strides directly; packing does not rearrange or copy weight scales.
+Their contents may change in place between calls or graph replays without
+repacking. Captured graphs require stable tensor pointers, shapes and layouts,
+with updates ordered before execution on the replay stream.
+
+After changing compiler or artifact configuration, call
+``layer.refresh_backends()`` outside CUDA Graph capture, or reconstruct the
+layer. Refresh adopts the current configuration and clears cached winners;
+existing packed calls and captured graphs retain their original resources.
+Each dtype's ``runtime.clear_artifact_cache()`` clears shared discovery caches
+for future builds and explicit refreshes. Existing engines retain their captured
+configuration, including when preparing a new token bucket, and do not check
+global artifact versions on each call. Cold compilation checks the assembler
+identity before and after compiling. Switching token counts does not create a
+native executor for each shape. The first FMA executor prepares its finite set
+of supported token specializations together, then dispatches them in native code.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
@@ -146,11 +181,12 @@ PTXAS executable only supplies the assembler for Frost's DSL kernels.
 
 On SM107, set ``FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas`` when the DSL bundles an older
 assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
-assemblers are rejected before kernel execution, including when reusing a cached
-automatic runner. Automatic selection skips unavailable Frost candidates;
+assemblers are rejected when building or refreshing a runner. Automatic
+selection skips unavailable Frost candidates;
 explicit selection reports the missing requirement.
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
-Admission checks the release version without imposing a patch-level minimum.
+Compiler preparation checks the release version without imposing a patch-level
+minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
 SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.

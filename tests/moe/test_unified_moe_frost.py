@@ -2,6 +2,7 @@
 """Unified Frost MoELayer configuration, admission, and GPU integration tests."""
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import replace
 import importlib
 from types import SimpleNamespace
@@ -104,7 +105,8 @@ def test_legacy_import_shares_module_and_caches(module):
     )
 
 
-def test_frost_weight_view_prefers_own_key_and_reuses_canonical():
+def test_frost_weight_view_prefers_own_key_and_reuses_canonical(monkeypatch):
+    from flashinfer.fused_moe.auto_candidates import additional_candidates
     from flashinfer.fused_moe.backends.cudnn_frost.support import weight_view
 
     canonical, own = {"canonical": torch.empty(0)}, {"own": torch.empty(0)}
@@ -113,18 +115,49 @@ def test_frost_weight_view_prefers_own_key_and_reuses_canonical():
     weights.prepare_for("cudnn_frost_nvfp4", own)
     assert weight_view(weights, "cudnn_frost_nvfp4", "cutlass_nvfp4") is own
 
+    key = "cudnn_frost_nvfp4"
+    support = importlib.import_module(_AUTO_CANDIDATES[key].support_module)
+    runner = SimpleNamespace(backend_key=key, accepts=lambda *args: True)
+    create = Mock(return_value=runner)
+    monkeypatch.setattr(support, "is_eligible", lambda *args: True)
+    monkeypatch.setattr(support, "create_runner", create)
+    cache = {}
+    options = dict(tuning=True, cache=cache, exclude=set(_AUTO_CANDIDATES) - {key})
+    weights.native_views.clear()
+    assert additional_candidates(None, None, 107, None, weights, **options) == []
+    assert not create.called
+    for view_key, view in (("cutlass_nvfp4", canonical), (key, own)):
+        weights.prepare_for(view_key, view)
+        assert additional_candidates(None, None, 107, None, weights, **options) == [
+            runner
+        ]
+        weights.native_views.clear()
+    assert create.call_count == 1
+    assert additional_candidates(None, None, 107, None, weights, **options) == []
+    assert cache[key] is runner  # Older packs/graphs keep the cached resource.
 
-def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
+
+def test_explicit_frost_uses_standard_packing_and_reuses_token_bucket(monkeypatch):
     class Runner:
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
 
-        def __init__(self, key, exact):
-            self.backend_key, self.requires_exact_shape = key, exact
+        def __init__(self, key, requires_view):
+            self.backend_key, self.requires_view = key, requires_view
+            self.generation = 0
+            self.validations = 0
+            self.packings = 0
 
         def accepts(self, act, weights):
-            return "cudnn_frost_bf16" in weights.native_views
+            return True
+
+        def refresh(self):
+            self.generation += 1
 
         def pack_inputs(self, act, weights):
+            self.validations += 1
+            if self.requires_view:
+                weights.native_views[self.backend_key]
+            self.packings += 1
             return [act.hidden_states_q]
 
         def launch_kwargs_for(self, inputs):
@@ -185,16 +218,33 @@ def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
     assert layer(a, weights) is a.hidden_states_q
     assert layer(b, weights) is b.hidden_states_q
     assert layer.winner_backend == frost.backend_key
-    assert len(selections) == 2  # Same token bucket, distinct native plans.
+    assert len(selections) == 1  # Same bucket reuses its backend and tactic.
     weights.native_views.clear()
-    layer(a, weights)
-    assert layer.winner_backend == "fallback"
-    assert len(selections) == 3
+    with pytest.raises(KeyError, match="cudnn_frost_bf16"):
+        layer(a, weights)
+    assert len(selections) == 1  # Invalid packs fail at packing, without fallback.
     weights.prepare_for("cudnn_frost_bf16", {})
     layer(a, weights)
     assert layer.winner_backend == frost.backend_key
-    assert len(selections) == 3
+    assert len(selections) == 1
     assert not layer._automatic_runners
+    assert frost.validations == 4
+    assert frost.packings == 3
+    layer(a, weights)
+    assert len(selections) == 1
+    assert frost.validations == 5
+    assert frost.packings == 4
+    frost.refresh()
+    layer(a, weights)
+    assert len(selections) == 1  # Runner snapshots do not qualify layer winners.
+    assert frost.validations == 6
+    assert frost.packings == 5
+    layer.refresh_backends()
+    assert not layer._winners
+    layer(a, weights)
+    assert len(selections) == 2  # Explicit layer refresh clears bucket winners.
+    assert frost.validations == 7
+    assert frost.packings == 6
 
 
 @pytest.mark.parametrize(
@@ -263,28 +313,59 @@ def test_bundled_assembler_is_independent_of_cuda_home(version, accepted, monkey
         ("mxfp8_mxfp4", "CudnnFrostMxfp8Mxfp4MoeRunner"),
     ],
 )
-def test_existing_runner_rechecks_selected_assembler(dtype, name, monkeypatch):
+def test_runner_refresh_rechecks_selected_assembler(dtype, name, monkeypatch):
+    from flashinfer.fused_moe.backends.cudnn_frost import engine
+
     module = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     runner = object.__new__(getattr(module, name))
-    runner.device, runner.config = "cuda", None
-    monkeypatch.setattr(module, "get_compute_capability", lambda _: (10, 7))
+    runner.device, runner.config, runner._built = torch.device("cuda:0"), None, True
+    selected = dict(backend="external_ptxas", version="release 13.5")
+    monkeypatch.setattr(engine.runtime, "_arch_for", lambda _: "sm_107a")
     monkeypatch.setattr(
-        module,
-        "large_bf16_moe" if dtype == "bf16" else "is_eligible",
-        lambda *args: True,
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=1),
     )
-    monkeypatch.setattr(
-        compiler,
-        "compiler_identity",
-        lambda: dict(backend="external_ptxas", version="release 13.3"),
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    reads = Mock(side_effect=lambda: selected.copy())
+    monkeypatch.setattr(compiler, "_read_compiler_identity", reads)
+    kernel = SimpleNamespace(tactic="test")
+    runner._engine = engine.FrostEngine(
+        runner.device,
+        artifact_roots=lambda: (),
+        artifact_version=lambda: 0,
+        refresh_artifacts=lambda: None,
+        policy_version="test",
+        tactic_tag="test",
+        select_kernels=lambda _: ((kernel,), (kernel,)),
+        select_fma=lambda _: None,
+        build_plan=lambda *args: pytest.fail("admission must not build a plan"),
+        require_assembler=True,
     )
-    # Reusing a constructed runner must not bypass the compiler gate. No tensor
-    # access or kernel compilation may happen on this rejected path.
-    assert runner.accepts(None, None) is False
+    validation = Mock(side_effect=ValueError("invalid pack"))
+    monkeypatch.setattr(runner, "pack_inputs", validation)
+    act, weights = object(), object()
+    assert runner.accepts(act, weights)
+    assert not validation.called
+    key = runner._engine._snapshot_key
+    with pytest.raises(ValueError, match="invalid pack"):
+        runner.pack_inputs(act, weights)
+    assert validation.call_count == 1
+
+    selected["version"] = "release 13.3"
+    assert runner.accepts(act, weights)
+    assert runner._engine._snapshot_key == key
+    assert reads.call_count == 1  # Admission leaves the built snapshot unchanged.
     with pytest.raises(NotImplementedError, match="CUDA 13.4"):
-        runner._validate_pack(None, None)
+        runner.refresh()
+    assert runner._engine._snapshot_key == key
+    selected["version"] = "release 13.6"
+    runner.refresh()
+    assert runner._engine._snapshot_key != key
+    assert reads.call_count == 3
 
 
 @pytest.fixture(scope="module", params=FORMATS)
@@ -375,6 +456,15 @@ def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
         with torch.cuda.graph(graph):
             graph_out = layer(act, own)
         ids.fill_(63)
+        graph_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(graph_out)
+
+        layer.refresh_backends()
+        assert not layer._winners
+        assert layer.winner_backend is None
+        check(layer(act, own))
         graph_out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
@@ -478,13 +568,24 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
     from flashinfer.fused_moe.backends.cudnn_frost import tuning
 
     tokens, e, h, i, k = 17, 16, 2048, 1536, 2
-    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     moe.runtime.clear_artifact_cache()
-    selection = Mock(wraps=moe.select_stages)
-    monkeypatch.setattr(moe, "select_stages", selection)
+    capture_selection = moe._capture_selection
+    selection = Mock()
+
+    def capture(*args):
+        snapshot = capture_selection(*args)
+
+        def select(shape):
+            selection(shape)
+            return snapshot.select_kernels(shape)
+
+        return snapshot._replace(select_kernels=select)
+
+    monkeypatch.setattr(moe, "_capture_selection", capture)
+    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
     stage_calls = set()
     original_forward = tuning._StageRunner.forward
 
@@ -521,12 +622,18 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
         ref = reference()
         check(out, ref)
         check(layer(act, weights), ref)
-        assert selection.call_count == 1  # Admission and packing share the result.
+        assert selection.call_count == 1  # Packing reuses this bucket's frozen pool.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             graph_out = layer(act, weights)
         ids.copy_(torch.tensor([e - 2, e - 1], device="cuda", dtype=ids.dtype))
         scores.copy_(scores.flip(-1))
+        scale_key = (
+            "fc1_weight_block_scale" if dtype == "nvfp4" else "fc1_expert_scales"
+        )
+        # The captured launch reads caller-owned SF directly; a content update
+        # needs neither a new pack nor graph recapture.
+        view[scale_key].view(torch.uint8).add_(1)
         changed_ref = reference()
         assert not torch.allclose(ref, changed_ref)
         graph_out.fill_(float("nan"))

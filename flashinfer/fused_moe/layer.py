@@ -422,19 +422,7 @@ class MoELayer:
         # here nor via a winner cached under the other mode, hence the
         # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
-        exact_shape = any(
-            getattr(r, "requires_exact_shape", False) for r in self.runners
-        )
-        configured = [
-            (index, r)
-            for index, r in enumerate(self.runners)
-            if mode in r.supported_routing_modes
-            and (
-                not getattr(r, "requires_exact_shape", False)
-                or r.accepts(act_pack, weight_pack)
-            )
-        ]
-        runners = [r for _, r in configured]
+        runners = [r for r in self.runners if mode in r.supported_routing_modes]
         additional = self._additional_candidates(act_pack, weight_pack)
         runners.extend(additional)
         if not runners:
@@ -445,31 +433,18 @@ class MoELayer:
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        # Optional plans can have exact geometry. Qualify their cache by both
-        # shape and eligible candidate set; rejected per-call layouts must not
-        # reuse a winner from a different set. Original bucket keys stay intact.
+        # All backends reuse winners within the same token bucket and routing
+        # mode. Optional candidates qualify the key by the eligible pool, so
+        # enabling or excluding a candidate cannot reuse another pool's winner.
         winner_key: tuple[Any, ...] = (
             (
                 bucket,
                 mode,
-                "automatic",
                 tuple(r.backend_key for r in additional),
-                tuple(act_pack.hidden_states_q.shape),
             )
             if additional
             else (bucket, mode)
         )
-        if exact_shape:
-            # Include configured positions so filtering one of two exact-shape
-            # runners with the same key cannot reuse the other's cached winner.
-            winner_key = (
-                bucket,
-                mode,
-                "exact",
-                tuple(index for index, _ in configured),
-                tuple(r.backend_key for r in additional),
-                tuple(act_pack.hidden_states_q.shape),
-            )
         winner = self._winners.get(winner_key)
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
@@ -582,3 +557,21 @@ class MoELayer:
         """Clear all cached per-bucket winners — next call re-tunes."""
         self._winners.clear()
         self._last_winner_backend = None
+
+    def refresh_backends(self) -> None:
+        """Refresh backend preparation and clear cached winners.
+
+        Call outside CUDA Graph capture after changing compiler or artifact
+        configuration. Backends with fixed preparation snapshots adopt the
+        current configuration; active packed calls and captured graphs keep
+        their existing resources. The next layer call selects a winner again.
+        """
+        self.reset_winner()
+        seen = set()
+        for runner in (*self.runners, *self._automatic_runners.values()):
+            if id(runner) in seen:
+                continue
+            seen.add(id(runner))
+            refresh = getattr(runner, "refresh", None)
+            if refresh is not None:
+                refresh()

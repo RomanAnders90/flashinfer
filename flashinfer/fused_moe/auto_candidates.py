@@ -15,24 +15,29 @@ from ..api_logging import experimental_auto_backends_allowed
 class AutoCandidateSpec:
     support_module: str
     experimental: bool = True
+    accepted_weight_views: tuple[str, ...] = ()
 
 
 _AUTO_CANDIDATES = {
     "cudnn_frost_bf16": AutoCandidateSpec(
         "flashinfer.fused_moe.backends.cudnn_frost.bf16.support",
         experimental=False,
+        accepted_weight_views=("cudnn_frost_bf16", "cutlass_bf16"),
     ),
     "cudnn_frost_mxfp8": AutoCandidateSpec(
         "flashinfer.fused_moe.backends.cudnn_frost.mxfp8.support",
         experimental=False,
+        accepted_weight_views=("cudnn_frost_mxfp8", "cutlass_mxfp8"),
     ),
     "cudnn_frost_nvfp4": AutoCandidateSpec(
         "flashinfer.fused_moe.backends.cudnn_frost.nvfp4.support",
         experimental=False,
+        accepted_weight_views=("cudnn_frost_nvfp4", "cutlass_nvfp4"),
     ),
     "cudnn_frost_mxfp8_mxfp4": AutoCandidateSpec(
         "flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4.support",
         experimental=False,
+        accepted_weight_views=("cudnn_frost_mxfp8_mxfp4", "cutlass_mxfp8_mxfp4"),
     ),
 }
 
@@ -43,10 +48,10 @@ def additional_candidates(
     """Return eligible runners, preserving layer-owned resources across captures.
 
     The support-module contract is ``is_eligible(config, act, arch)`` followed by
-    ``create_runner(config, device)``. The runner's ``accepts(act, weights)`` must
-    validate per-call layouts/semantics before any winner-cache lookup. Disabling
-    a registration or its gate excludes its cached runner without destroying
-    resources still referenced by captured graphs.
+    ``create_runner(config, device)``. ``accepts(act, weights)`` applies optional
+    per-call eligibility constraints; ``pack_inputs`` validates the input packs.
+    Disabling a registration or its gate excludes its cached runner without
+    destroying resources still referenced by captured graphs.
     """
     candidates = []
     for key, spec in _AUTO_CANDIDATES.items():
@@ -55,6 +60,13 @@ def additional_candidates(
         ):
             continue
         if not tuning and key not in cache:
+            continue
+        # A lazy candidate can only reuse layouts already supplied by the
+        # caller. Inspect view names here, leaving all tensor validation and
+        # kernel preparation in the standard pack_inputs path.
+        if spec.accepted_weight_views and not any(
+            view in weights.native_views for view in spec.accepted_weight_views
+        ):
             continue
         support = import_module(spec.support_module)
         if not support.is_eligible(config, act, arch):
